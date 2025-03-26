@@ -483,8 +483,8 @@ class AgentRoleWidget(QFrame):
         
         # Extract the source index from the mime data
         mime_data = event.mimeData()
-        if mime_data.hasFormat("application/x-agent-role"):
-            source_index_bytes = mime_data.data("application/x-agent-role")
+        if mime_data.hasFormat("application/x-agent-index"):
+            source_index_bytes = mime_data.data("application/x-agent-index")
             # Convert bytes back to integer
             source_index = int(source_index_bytes.data())
             
@@ -547,6 +547,14 @@ class GeminiChatApp(QMainWindow):
         self.resize(1200, 800)
         self.setMinimumSize(800, 600)
         
+        # Set window icon if available
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png")
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+        except Exception as e:
+            logging.warning(f"Could not set window icon: {e}")
+        
         # Global variables
         self.num_pages = 20
         self.input_entries = []
@@ -557,6 +565,7 @@ class GeminiChatApp(QMainWindow):
         self.multi_agent_enabled = False
         self.web_search_enabled = False
         self.active_agents = {}
+        self.current_generated_image = None  # Store the generated image
         
         # Add agent memory
         self.agent_memory = AgentMemory()
@@ -617,6 +626,10 @@ class GeminiChatApp(QMainWindow):
     def setup_shortcuts(self):
         """Setup keyboard shortcuts for the application"""
         # Generate response shortcut (Ctrl+Return)
+        self.generate_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.generate_shortcut.activated.connect(self.generate_current_tab)
+        
+        # Next tab shortcut (Ctrl+Tab)
         self.next_tab_shortcut = QShortcut(QKeySequence("Ctrl+Tab"), self)
         self.next_tab_shortcut.activated.connect(self.next_tab)
         
@@ -629,7 +642,27 @@ class GeminiChatApp(QMainWindow):
         self.save_shortcut.activated.connect(
             lambda: self.perform_file_operation("save")
         )
+        
+        # Clear history shortcut (Ctrl+L)
+        self.clear_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        self.clear_shortcut.activated.connect(self.clear_current_history)
+        
+        # Stop generation shortcut (Escape)
+        self.stop_shortcut = QShortcut(QKeySequence("Escape"), self)
+        self.stop_shortcut.activated.connect(self.stop_generation)
     
+    def generate_current_tab(self):
+        """Generate response for the current tab"""
+        current_index = self.chat_tabs.currentIndex()
+        if current_index >= 0:
+            self.generate_response(current_index)
+            
+    def clear_current_history(self):
+        """Clear history for the current tab"""
+        current_index = self.chat_tabs.currentIndex()
+        if current_index >= 0:
+            self.clear_history(current_index)
+
     def next_tab(self):
         """Switch to the next tab"""
         current = self.chat_tabs.currentIndex()
@@ -652,7 +685,7 @@ class GeminiChatApp(QMainWindow):
         # Header
         header_frame = QFrame()
         header_layout = QVBoxLayout(header_frame)
-        header_label = QLabel("OpenAI Chat Enhanced")
+        header_label = QLabel("GEMINI Chat Enhanced")
         header_label.setFont(current_fonts["heading"])
         header_label.setAlignment(Qt.AlignCenter)
         header_layout.addWidget(header_label)
@@ -2409,7 +2442,8 @@ class GeminiChatApp(QMainWindow):
         
         try:
             # Check for API key
-            if not os.getenv("GEMINI_API_KEY"):
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
                 QMessageBox.critical(self, "API Key Error", 
                     "Gemini API key not found. Please set the GEMINI_API_KEY environment variable.")
                 return
@@ -2431,6 +2465,7 @@ class GeminiChatApp(QMainWindow):
             self.progress_bar.show()
             
             # Clear previous image
+            self.image_display.clear()  # Use clear() instead of setText()
             self.image_display.setText("Generating image...")
             self.save_image_button.setEnabled(False)
             
@@ -2996,17 +3031,36 @@ class GeminiChatApp(QMainWindow):
             border-radius: 4px;
             width: 0%;
         """)
-        self.progress_indicator.setFixedWidth(0)
         self.progress_bar.show()
         
         # Update status
         self.status_left.setText("Generating response...")
         
-        # Save to conversation history
-        chat_histories[page_index] = {
-            "input": self.input_entries[page_index].toPlainText(),
-            "output": self.output_texts[page_index].toPlainText()
-        }
+        # Start progress animation
+        global stop_event
+        stop_event.clear()
+        progress_thread = Thread(target=self.animate_progress)
+        progress_thread.daemon = True
+        progress_thread.start()
+        
+        # Create and run worker in a thread for standard response generation
+        self.thread = QThread()
+        self.worker = GeminiWorker(prompt, model_settings)
+        self.worker.moveToThread(self.thread)
+        
+        # Connect signals
+        self.thread.started.connect(self.worker.generate)
+        self.worker.generation_complete.connect(lambda text: self.handle_standard_response(text, page_index))
+        self.worker.generation_error.connect(self.handle_generation_error)
+        self.worker.generation_complete.connect(self.thread.quit)
+        self.worker.generation_error.connect(self.thread.quit)
+        self.thread.finished.connect(self.thread.deleteLater)
+        
+        # Store current page index for the handler
+        self.current_page_index = page_index
+        
+        # Start thread
+        self.thread.start()
 
     def run_agent(self, input_text, page_index):
         """Run agent mode for response generation"""
@@ -3272,6 +3326,53 @@ class GeminiChatApp(QMainWindow):
         if stop_event.is_set():
             self.progress_bar.hide()
 
+    def handle_standard_response(self, response_text, page_index):
+        """Handle the response from standard (non-agent) generation"""
+        # Stop progress
+        global stop_event
+        stop_event.set()
+        self.progress_bar.hide()
+        
+        # Update status
+        self.status_left.setText("Ready")
+        
+        # Add the response to chat history
+        if page_index not in chat_histories:
+            chat_histories[page_index] = []
+            
+        chat_histories[page_index].append({"role": "assistant", "content": response_text})
+        
+        # Build the full conversation display
+        conversation_display = ""
+        for msg in chat_histories[page_index]:
+            prefix = "User: " if msg["role"] == "user" else "Assistant: "
+            conversation_display += f"{prefix}{msg['content']}\n\n"
+        
+        # Remove trailing "Generating..." text if present
+        if conversation_display.endswith("Assistant: Generating...\n\n"):
+            conversation_display = conversation_display.replace("Assistant: Generating...\n\n", "")
+        
+        # Update output text
+        self.output_texts[page_index].setPlainText(conversation_display)
+        
+        # Scroll to bottom
+        cursor = self.output_texts[page_index].textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.output_texts[page_index].setTextCursor(cursor)
+
+    def clear_history(self, page_index):
+        """Clear conversation history for a specific chat tab"""
+        # Clear the history in memory
+        if page_index in chat_histories:
+            chat_histories[page_index] = []
+        
+        # Clear the input and output fields
+        self.input_entries[page_index].clear()
+        self.output_texts[page_index].clear()
+        
+        # Show confirmation
+        Toast.show(self, f"History cleared for Page {page_index+1}", 1500)
+
 # Add a worker class for multi-agent dialog
 class GeminiDialogWorker(QObject):
     agent_response = pyqtSignal(int, str)
@@ -3411,16 +3512,3 @@ if __name__ == "__main__":
     window.setWindowTitle("Gemini Chat Enhanced")  # Change window title
     window.show()
     sys.exit(app.exec_())
-
-def update_interaction_controls(self):
-    """Update UI controls based on selected interaction mode"""
-    mode = self.interaction_mode_selector.currentText()
-    continuous_mode = (mode == "Continuous Debate")
-    
-    # Show/hide turn limit controls based on continuous mode
-    self.turn_limit_spinner.setEnabled(continuous_mode)
-    # Find and update the turn limit label
-    for i in range(self.interaction_mode_selector.parentWidget().layout().count()):
-        widget = self.interaction_mode_selector.parentWidget().layout().itemAt(i).widget()
-        if isinstance(widget, QLabel) and widget.text() == "Turn Limit:":
-            widget.setEnabled(continuous_mode)
