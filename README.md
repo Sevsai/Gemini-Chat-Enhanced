@@ -1,6 +1,7 @@
 # Gemini Chat Enhanced
 
-![Gemini Chat Enhanced](assets/logo.png)
+![image](https://github.com/user-attachments/assets/f291e0c3-d61b-4ae1-b6ae-4d18c3455f0a)
+
 
 A feature-rich desktop chat application built with PyQt5 that uses Google's Gemini API for text generation, multi-agent conversations, and image generation capabilities.
 
